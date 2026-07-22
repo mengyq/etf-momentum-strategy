@@ -1,0 +1,23 @@
+{
+  "backtest_period": "2022-03-16 ~ 2026-07-21",
+  "years": 4.18,
+  "trading_days": "1,053",
+  "etf_universe": 35,
+  "top_n": 5,
+  "rebalance_freq": "weekly (5 trading days)",
+  "strategy_total_return_pct": 59.86,
+  "strategy_annual_return_pct": 11.88,
+  "benchmark_total_return_pct": 45.05,
+  "benchmark_annual_return_pct": 9.31,
+  "excess_return_pct": 14.81,
+  "max_drawdown_pct": -28.1,
+  "sharpe_ratio": 0.26,
+  "calmar_ratio": 0.42,
+  "total_exits": 198,
+  "win_rate_pct": 39.4,
+  "avg_win_pct": 5.61,
+  "avg_loss_pct": -3.57,
+  "profit_loss_ratio": 1.57,
+  "monthly_win_rate_pct": 50.9,
+  "final_capital": 1598617
+}
