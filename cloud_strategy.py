@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ETF动量策略 - 云端运行版（AlphaFeed数据源，自动推送通知）"""
-import os, sys, json, smtplib, time, io, csv, warnings
+"""ETF动量策略 - 云端运行版（含PushPlus微信推送）"""
+import os, sys, json, smtplib, time, io, csv, warnings, urllib.request
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
@@ -12,6 +12,7 @@ ALPHAFEED_KEY = os.environ.get("ALPHAFEED_API_KEY", "")
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_TO = os.environ.get("SMTP_TO", "")
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 PORTFOLIO_FILE = "portfolio.json"
 
 ETF_POOL = {
@@ -42,24 +43,20 @@ MOMENTUM_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
 TOP_N = 2; STOP_PCT = -12; MAX_HOLD = 30
 
 def fetch_data(force_refresh=False):
-    """获取全部ETF最新行情"""
     from alphafeed import AlphaFeed
     import pandas as pd, pickle
-
     cache_dir = Path(__file__).parent / "data_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     all_data = {}
     todo = list(ETF_POOL.keys())
-
     if not force_refresh:
         for sym in todo:
-            cf = cache_dir / f"{sym.replace(".", "_")}.pkl"
+            cf = cache_dir / f"{sym.replace('.', '_')}.pkl"
             if cf.exists():
                 try:
                     df = pd.read_pickle(str(cf))
                     if len(df) > 200: all_data[sym] = df
                 except: pass
-
     todo = [s for s in todo if s not in all_data]
     if todo:
         print(f"从API获取 {len(todo)} 只ETF数据...")
@@ -74,7 +71,7 @@ def fetch_data(force_refresh=False):
                     df = df.sort_values("trade_date").reset_index(drop=True)
                     df["date"] = df["trade_date"]
                     all_data[sym] = df
-                    df.to_pickle(str(cache_dir / f"{sym.replace(".", "_")}.pkl"))
+                    df.to_pickle(str(cache_dir / f"{sym.replace('.', '_')}.pkl"))
                     print(f"{len(df)}行")
                 else: print("数据不足")
             except Exception as e: print(f"错误: {e}")
@@ -83,10 +80,8 @@ def fetch_data(force_refresh=False):
 
 
 def calc_momentum(data):
-    """计算动量排名（含行业分散）"""
     import numpy as np
     import pandas as pd
-
     scores = {}
     for sym, df in data.items():
         close = df["close"].values
@@ -99,33 +94,27 @@ def calc_momentum(data):
             info = ETF_POOL.get(sym, {})
             scores[sym] = {"score": score, "sector": info.get("sector", ""),
                           "name": info.get("name", sym)}
-
     si = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
     picks = []; seen = set()
     for sym, info in si:
         sec = info["sector"]
-        if len(picks) == 0:
-            picks.append(sym); seen.add(sec)
-        elif len(picks) < TOP_N and sec not in seen:
-            picks.append(sym); seen.add(sec)
+        if len(picks) == 0: picks.append(sym); seen.add(sec)
+        elif len(picks) < TOP_N and sec not in seen: picks.append(sym); seen.add(sec)
         else: break
     return si, picks
 
 
 def get_live_prices(data):
-    """获取实时行情"""
     from alphafeed import AlphaFeed
     try:
         client = AlphaFeed(api_key=ALPHAFEED_KEY)
         quotes = client.quotes.get(symbols=list(data.keys()), to_dataframe=True)
-        return {sym: float(quotes.loc[sym, "last_price"])
-                for sym in data if sym in quotes.index}
+        return {sym: float(quotes.loc[sym, "last_price"]) for sym in data if sym in quotes.index}
     except:
         return {sym: float(df["close"].iloc[-1]) for sym, df in data.items()}
 
 
 def load_portfolio():
-    """加载持仓记录"""
     pf = Path(PORTFOLIO_FILE)
     if not pf.exists():
         return {"entries": [], "cash": 0, "last_update": ""}
@@ -134,20 +123,16 @@ def load_portfolio():
     except:
         return {"entries": [], "cash": 0, "last_update": ""}
 
+
 def build_signal_msg(si, picks, prices):
-    """生成买入信号文本"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = ["=" * 40,
-             f" ETF动量策略 - 周度信号  {now}",
-             "=" * 40, ""]
+    lines = ["=" * 40, f" ETF动量策略 - 周度信号  {now}", "=" * 40, ""]
     lines.append("| 买入持仓 Top 2（行业分散）|")
     lines.append("-" * 40)
     for i, (sym, info) in enumerate(si[:8]):
         price = prices.get(sym, 0)
         tag = ">> BUY" if sym in picks else "  watch"
-        lines.append(f" #{i+1} {info['name']} ({sym})  "
-                    f"动量{info['score']*100:.1f}  "
-                    f"{info['sector']}  {tag}")
+        lines.append(f" #{i+1} {info['name']} ({sym})  动量{info['score']*100:.1f}  {info['sector']}  {tag}")
     lines.append("")
     if picks:
         lines.append("| 建议操作 |")
@@ -163,165 +148,131 @@ def build_signal_msg(si, picks, prices):
 
 
 def build_portfolio_msg(data, prices):
-    """生成持仓盈亏报告"""
     portfolio = load_portfolio()
     if not portfolio["entries"]:
-        return "当前无持仓记录。请在 portfolio.json 中填写持仓信息。"
+        return "当前无持仓记录。"
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = ["=" * 40,
-             f" ETF持仓报告  {now}",
-             "=" * 40, ""]
+    lines = ["=" * 40, f" ETF持仓报告  {now}", "=" * 40, ""]
     lines.append("| 持仓明细 |")
     lines.append(f"{'ETF':<18s} {'现价':>8s} {'成本':>8s} {'盈亏':>10s} {'天数':>6s}")
     lines.append("-" * 50)
 
-    total_pnl = 0.0
-    total_cost = 0.0
+    total_pnl = 0.0; total_cost = 0.0
+    stop_alerts = []
+
     for entry in portfolio["entries"]:
-        sym = entry["etf"]
-        shares = entry["shares"]
-        cost_price = entry["price"]
+        sym = entry["etf"]; shares = entry["shares"]; cost_price = entry["price"]
         entry_date = entry.get("date", "")
         name = ETF_POOL.get(sym, {}).get("name", sym)
         current_price = prices.get(sym, 0)
-
         cost_value = shares * cost_price
         current_value = shares * current_price
         pnl_pct = (current_price / cost_price - 1) * 100
         pnl_value = current_value - cost_value
-
         if entry_date:
-            try:
-                hold_days = (datetime.now() - datetime.strptime(entry_date, "%Y-%m-%d")).days
-            except:
-                hold_days = 0
-        else:
-            hold_days = 0
+            try: hold_days = (datetime.now() - datetime.strptime(entry_date, "%Y-%m-%d")).days
+            except: hold_days = 0
+        else: hold_days = 0
+        lines.append(f"{name:<8s} {current_price:>8.3f} {cost_price:>8.3f} {pnl_pct:>+8.2f}% {hold_days:>4d}d")
+        total_pnl += pnl_value; total_cost += cost_value
 
-        lines.append(f"{name:<8s} {current_price:>8.3f} {cost_price:>8.3f} "
-                    f"{pnl_pct:>+8.2f}% {hold_days:>4d}d")
-        total_pnl += pnl_value
-        total_cost += cost_value
+        # 止损检查
+        if pnl_pct <= STOP_PCT:
+            stop_alerts.append(f"  !! {name} 触发止损! 盈亏{pnl_pct:.1f}% (止损线{STOP_PCT}%)")
 
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
     lines.append("-" * 50)
-    lines.append(f"总投入: {total_cost:>.0f}")
+    lines.append(f"总投入: {total_cost:.0f}")
     lines.append(f"总盈亏: {total_pnl:>+.0f} ({total_pnl_pct:>+.2f}%)")
-    lines.append(f"现金: {portfolio.get('cash', 0):>.0f}")
+    lines.append(f"现金: {portfolio.get('cash', 0):.0f}")
     total_assets = total_cost + total_pnl + portfolio.get("cash", 0)
-    lines.append(f"总资产: {total_assets:>.0f}")
-
-    # 止损检查
-    stop_alerts = []
-    for entry in portfolio["entries"]:
-        sym = entry["etf"]
-        cost_price = entry["price"]
-        current_price = prices.get(sym, 0)
-        pnl = (current_price / cost_price - 1) * 100
-        if pnl <= STOP_PCT:
-            name = ETF_POOL.get(sym, {}).get("name", sym)
-            stop_alerts.append(f"  {name} 触发止损线! 盈亏{pnl:.1f}% (止损线{STOP_PCT}%)")
+    lines.append(f"总资产: {total_assets:.0f}")
 
     if stop_alerts:
-        lines.append("")
-        lines.append("| 风险警告 |")
+        lines.append(""); lines.append("| 风险警告 |")
         lines.extend(stop_alerts)
     lines.append("=" * 40)
     return chr(10).join(lines)
 
+
 def send_email(subject, body):
-    """发送邮件通知"""
     if not SMTP_USER or not SMTP_PASS or not SMTP_TO:
         print("[邮件] 未配置SMTP，跳过")
-        return False
+        return
     try:
         msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = SMTP_USER
-        msg["To"] = SMTP_TO
-        host = "smtp.qq.com"
-        port = 587
-        # 自动识别邮箱类型
-        if "gmail" in SMTP_USER.lower():
-            host = "smtp.gmail.com"
-        elif "163" in SMTP_USER.lower():
-            host = "smtp.163.com"
-            port = 25
+        msg["Subject"] = subject; msg["From"] = SMTP_USER; msg["To"] = SMTP_TO
+        host = "smtp.qq.com"; port = 587
+        if "163" in SMTP_USER.lower(): host = "smtp.163.com"; port = 25
         with smtplib.SMTP(host, port, timeout=10) as s:
             if port == 587: s.starttls()
             s.login(SMTP_USER, SMTP_PASS)
             s.send_message(msg)
         print(f"[邮件] 已发送到 {SMTP_TO}")
-        return True
+    except smtplib.SMTPAuthenticationError:
+        print("[邮件] 登录失败：授权码错误")
     except Exception as e:
         print(f"[邮件] 发送失败: {e}")
-        return False
 
 
-def send_serverchan(title, body):
-    """微信推送 (ServerChan，免费)"""
-    import requests
-    key = os.environ.get("SERVERCHAN_KEY", "")
-    if not key:
-        print("[微信] 未配置 ServerChan，跳过")
+def send_pushplus(title, body):
+    """微信推送 (PushPlus)"""
+    if not PUSHPLUS_TOKEN:
+        print("[微信PushPlus] 未配置 PUSHPLUS_TOKEN，跳过")
         return
+    content = body[:2000]
+    data = {"token": PUSHPLUS_TOKEN, "title": title,
+            "content": content.replace(chr(10), "<br>"), "template": "html"}
     try:
-        r = requests.post(f"https://sctapi.ftqq.com/{key}.send",
-                         data={"title": title, "desp": body}, timeout=10)
-        if r.json().get("code") == 0:
-            print("[微信] 已发送")
+        req = urllib.request.Request("https://www.pushplus.plus/send",
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") == 200:
+            print("[微信PushPlus] 已发送")
         else:
-            print(f"[微信] 失败: {r.text}")
+            print(f"[微信PushPlus] 失败: {result}")
     except Exception as e:
-        print(f"[微信] 错误: {e}")
+        print(f"[微信PushPlus] 错误: {e}")
 
 
 def update_portfolio_signals(picks, prices):
-    """将信号写入持仓文件（供参考）"""
     portfolio = load_portfolio()
-    if not portfolio["entries"]:
-        portfolio["entries"] = []
+    if not portfolio["entries"]: portfolio["entries"] = []
     portfolio["last_signal"] = datetime.now().strftime("%Y-%m-%d")
     portfolio["signals"] = []
     for sym in picks:
         price = prices.get(sym, 0)
         portfolio["signals"].append({
-            "etf": sym,
-            "name": ETF_POOL.get(sym, {}).get("name", sym),
-            "signal_price": price,
-            "date": datetime.now().strftime("%Y-%m-%d")
+            "etf": sym, "name": ETF_POOL.get(sym, {}).get("name", sym),
+            "signal_price": price, "date": datetime.now().strftime("%Y-%m-%d")
         })
-    Path(PORTFOLIO_FILE).write_text(
-        json.dumps(portfolio, indent=2, ensure_ascii=False), encoding="utf-8")
+    Path(PORTFOLIO_FILE).write_text(json.dumps(portfolio, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 def main():
-    import argparse, pickle
+    import argparse
     parser = argparse.ArgumentParser(description="ETF动量策略云端版")
     parser.add_argument("--signal", action="store_true", help="生成周度信号")
     parser.add_argument("--report", action="store_true", help="生成持仓报告")
     parser.add_argument("--refresh", action="store_true", help="刷新数据")
     parser.add_argument("--email", action="store_true", help="邮件推送")
-    parser.add_argument("--wechat", action="store_true", help="微信推送")
+    parser.add_argument("--wechat", action="store_true", help="微信推送(PushPlus)")
     args = parser.parse_args()
 
     if not (args.signal or args.report):
-        args.signal = True
-        args.report = True
+        args.signal = True; args.report = True
 
-    # 获取数据
     data = fetch_data(force_refresh=args.refresh)
     if not data:
-        print("错误: 无法获取数据")
-        return 1
+        print("错误: 无法获取数据"); return 1
     print(f"获取到 {len(data)} 只ETF数据")
 
-    # 获取实时价格
     prices = get_live_prices(data)
-
     email_body_parts = []
 
-    # 生成信号
     if args.signal:
         print("生成周度信号...")
         si, picks = calc_momentum(data)
@@ -330,21 +281,19 @@ def main():
         email_body_parts.append(msg)
         update_portfolio_signals(picks, prices)
 
-    # 生成持仓报告
     if args.report:
         print("生成持仓报告...")
         msg2 = build_portfolio_msg(data, prices)
         print(msg2)
         email_body_parts.append(msg2)
 
-    # 发送通知
     full_body = chr(10).join(email_body_parts)
     title = f"ETF策略 {'信号' if args.signal else ''} {'报告' if args.report else ''}"
 
     if args.email:
         send_email(title, full_body)
     if args.wechat:
-        send_serverchan(title, full_body)
+        send_pushplus(title, full_body)
     if not args.email and not args.wechat:
         print("添加 --email 或 --wechat 参数推送通知")
 
